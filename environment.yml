@@ -1,0 +1,16 @@
+name: project4
+channels:
+  - conda-forge
+  - pytorch
+dependencies:
+  - python>=3.6
+  - numpy
+  - matplotlib
+  - pandas
+  - scipy
+  - pytorch==1.3.0
+  - torchvision==0.4.1
+  - pip
+  - pip:
+    - garage
+    - airsimneurips
