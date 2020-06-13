@@ -10,8 +10,14 @@ import akro
 import gym
 from scipy.spatial.transform.rotation import Rotation
 
-# necessary garage modules
 import garage.torch.utils as tu
+from garage.envs import GarageEnv, normalize
+from garage import wrap_experiment
+from garage.experiment import LocalRunner
+from garage.experiment.deterministic import set_seed
+from garage.torch.algos import VPG
+from garage.torch.policies import GaussianMLPPolicy
+from garage.torch.value_functions import GaussianMLPValueFunction
 
 # airsimneurips API
 import airsimneurips as airsim
@@ -23,15 +29,31 @@ if torch.cuda.is_available():
 else:
     tu.set_gpu_mode(False)
 
+parser = ArgumentParser()
+parser.add_argument('--level_name', type=str,
+                    choices=["Soccer_Field_Easy", "Soccer_Field_Medium", "ZhangJiaJie_Medium", "Building99_Hard",
+                             "Qualifier_Tier_1", "Qualifier_Tier_2", "Qualifier_Tier_3", "Final_Tier_1",
+                             "Final_Tier_2", "Final_Tier_3"], default="Soccer_Field_Easy")
+parser.add_argument('--train', dest='train', action='store_true', default=True)
+parser.add_argument('--test', dest='test', action='store_true', default=False)
+parser.add_argument('--enable_viz_traj', dest='viz_traj', action='store_true', default=False)
+parser.add_argument('--enable_viz_image_cv2', dest='viz_image_cv2', action='store_true', default=True)
+parser.add_argument('--race_tier', type=int, choices=[1, 2, 3], default=1)
+args = parser.parse_args()
+
+# video recorder
+# Define the codec and create VideoWriter object
+fourcc = cv2.VideoWriter_fourcc(*'XVID')
+video_writer = cv2.VideoWriter('./fpv_cam.avi', fourcc, 20.0, (320, 240))
+
 
 class RLRacer(BaselineRacer):
     '''Racing drone with reinforcement learning used as a planner'''
 
-    def __init__(self, agent, opponent, env_params=None):
+    def __init__(self, agent, opponent):
         print("Creating RLRacer object...")
         self.agent = agent
         self.opponent = opponent
-        self.env_params = env_params
         super(RLRacer, self).__init__()
         self.img_rgb = None
         self.odom = None
@@ -102,8 +124,30 @@ class RLRacer(BaselineRacer):
     def get_odom(self):
         return self.odom
 
-    def train(self):
-        pass
+    def train(self, ctxt=None, seed=42):
+        env = GarageEnv(normalize(RacingEnv(self)))
+        setattr(env, 'name', self.level_name)
+        set_seed(seed)
+        runner = LocalRunner()
+        policy = GaussianMLPPolicy(env_spec=env.spec,
+                                   hidden_sizes=[256, 256, 128],
+                                   hidden_nonlinearity=torch.tanh,
+                                   output_nonlinearity=None)
+        value_function = GaussianMLPValueFunction(env_spec=env.spec,
+                                                  hidden_sizes=[128, 128, 64],
+                                                  hidden_nonlinearity=torch.tanh,
+                                                  output_nonlinearity=None
+                                                  )
+
+        algo = VPG(env_spec=env.spec,
+                   policy=policy,
+                   value_function=value_function,
+                   max_path_length=500,
+                   discount=0.99,
+                   center_adv=False)
+
+        runner.setup(algo, env)
+        runner.train(n_epochs=100, batch_size=1)
 
     def test(self):
         pass
@@ -232,7 +276,8 @@ class RacingEnv(gym.Env):
         img_space = akro.Box(low=0, high=255, shape=(self.img_height, self.img_width, self.img_channels),
                              dtype=np.uint8)
 
-        return img_space.concat(akro.Box(low=min_bounds, high=max_bounds, dtype=np.float32))
+        return akro.Box(low=min_bounds, high=max_bounds, dtype=np.float32)
+        # return img_space.concat(akro.Box(low=min_bounds, high=max_bounds, dtype=np.float32))
 
     @property
     def action_space(self):
@@ -274,6 +319,8 @@ class RacingEnv(gym.Env):
             if drone == 'agent':
                 next_gate_pose = self.racer.gate_poses_ground_truth[next_gate_idx]
 
+        video_writer.open('./fpv_cam.avi', fourcc, 20.0, (320, 240))
+        video_writer.write(img_rgb)
         obs = Observation(img_rgb=img_rgb, odom=odom, gates_passed=gates_passed.copy(),
                           gate_pose=next_gate_pose)
         self._state = obs
@@ -298,7 +345,10 @@ class RacingEnv(gym.Env):
 
         obs = self.observe()
 
-        return obs
+        return obs.to_numpy_array()
+
+    def render(self):
+        pass
 
     def step(self, action, imshow=True):
         # action = (vx, vy, vz, roll, pitch, yaw_rate, throttle)
@@ -317,7 +367,7 @@ class RacingEnv(gym.Env):
         next_observation = self.observe()
         print(next_observation)
         reward, done = self.reward_function(action, next_observation)
-        return next_observation, reward, done, None
+        return next_observation.to_numpy_array(), reward, done, None
 
     def reward_function(self, action, observed_state):
         """Reward is the same as negative level cost"""
@@ -352,7 +402,7 @@ class RacingEnv(gym.Env):
         else:  # collision occurs
             # if collision with drone
             # if self.env_client.simIsRacerDisqualified(vehicle_name=self.racer.agent):
-                  # drone is disqualified
+            # drone is disqualified
             #     reward = self.loss_reward
             #     done = True
             if collision_info.object_name == 'drone_2':
@@ -397,8 +447,17 @@ class Observation:
     def imshow(self):
         cv2.imshow('observed_img', self.img_rgb)
 
+    def to_numpy_array(self):
+        return np.block([[self.odom['agent'][1].to_numpy_array().reshape(1, -1),
+                          self.odom['agent'][2].to_numpy_array().reshape(1, -1),
+                          self.odom['agent'][3].to_numpy_array().reshape(1, -1)],  # row 1
+                         [self.odom['opponent'][1].to_numpy_array().reshape(1, -1),
+                          self.odom['opponent'][2].to_numpy_array().reshape(1, -1),
+                          self.odom['opponent'][3].to_numpy_array().reshape(1, -1)]  # row 2
+                         ])
 
-def main(args):
+
+def main():
     # ensure you have generated the neurips planning settings file by running python generate_settings_file.py
     agent, opponent = 'drone_1', 'drone_2'
     rl_racer = RLRacer(agent='drone_1', opponent='drone_2')
@@ -417,33 +476,40 @@ def main(args):
     rl_racer.start_odometry_callback_thread()
 
     # rl_racer.pause_sim()
+    # race_env = normalize(RacingEnv(rl_racer))
+    # race_env = GarageEnv(env=race_env)
     race_env = RacingEnv(rl_racer)
     T = 0
     while True:
-        if T % 20 == 0:
+        if T == 40:
             race_env.reset()
+            video_writer.release()
+            cv2.destroyAllWindows()
+            break
         race_env.step(action=race_env.action_space.sample())
         T += 1
 
     if args.train:
-        # train a neural network policy using MAML
-        rl_racer.train()
+        pass
+        # rl_racer.train(race_env)
+        # debug_my_algorithm(ctxt=None, env=race_env)
 
     if args.test:
         # test the trained policy and report results
         rl_racer.test()
+    rl_racer.stop_odometry_callback_thread()
+    rl_racer.stop_image_callback_thread()
+
+# @wrap_experiment
+# def debug_my_algorithm(ctxt=None):
+#     set_seed(99)
+#     runner = LocalRunner(ctxt)
+#     policy = GaussianMLPPolicy(env.spec)
+#     algo = VPG(env.spec, policy)
+#     algo.to()
+#     runner.setup(algo, env)
+#     runner.train(n_epochs=499, batch_size=4000)
 
 
 if __name__ == "__main__":
-    parser = ArgumentParser()
-    parser.add_argument('--level_name', type=str,
-                        choices=["Soccer_Field_Easy", "Soccer_Field_Medium", "ZhangJiaJie_Medium", "Building99_Hard",
-                                 "Qualifier_Tier_1", "Qualifier_Tier_2", "Qualifier_Tier_3", "Final_Tier_1",
-                                 "Final_Tier_2", "Final_Tier_3"], default="Soccer_Field_Easy")
-    parser.add_argument('--train', dest='train', action='store_true', default=False)
-    parser.add_argument('--test', dest='test', action='store_true', default=False)
-    parser.add_argument('--enable_viz_traj', dest='viz_traj', action='store_true', default=False)
-    parser.add_argument('--enable_viz_image_cv2', dest='viz_image_cv2', action='store_true', default=True)
-    parser.add_argument('--race_tier', type=int, choices=[1, 2, 3], default=1)
-    args = parser.parse_args()
-    main(args)
+    main()

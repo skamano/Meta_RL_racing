@@ -8,9 +8,11 @@ dependencies:
   - matplotlib
   - pandas
   - scipy
+  - opencv
   - pytorch==1.3.0
   - torchvision==0.4.1
   - pip
   - pip:
-    - garage
     - airsimneurips
+    - pyglet==1.3.2
+    - cloudpickle==1.2.0
